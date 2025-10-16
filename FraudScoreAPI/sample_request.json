@@ -1,0 +1,13 @@
+{
+  "transaction_id": "tx_123",
+  "amount": 750,
+  "country": "RU",
+  "ip": "181.45.77.2",
+  "hour": 23,
+  "currency": "EUR",
+  "user_id": "user_9",
+  "device_id": null,
+  "card_bin": null,
+  "attempts_last_10m": 6,
+  "three_ds_result": "failed"
+}
