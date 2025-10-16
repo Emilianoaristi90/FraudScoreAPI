@@ -1,4 +1,4 @@
-# main.py — FraudScore API (v1.4.0) con Playground
+# main.py — FraudScore API (v1.4.1) con Playground público
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -6,7 +6,7 @@ from datetime import datetime
 import logging
 import os
 
-app = FastAPI(title="FraudScore API", version="1.4.0")
+app = FastAPI(title="FraudScore API", version="1.4.1")
 
 # --- CONFIGURACIÓN ---
 API_KEY = os.getenv("API_KEY", "mi-clave-pro")
@@ -69,16 +69,17 @@ def evaluate_rules(tx: Transaction) -> dict:
 # --- MIDDLEWARE (Auth + Rate limit por API key) ---
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    public_paths = {"/", "/health", "/docs", "/openapi.json", "/favicon.ico", "/playground"}
-    if request.url.path in public_paths:
+    # Rutas públicas (no requieren API Key)
+    public_paths = {"/", "/health", "/docs", "/openapi.json", "/favicon.ico"}
+    if request.url.path in public_paths or request.url.path.startswith("/playground"):
         return await call_next(request)
 
-    # Auth
+    # Auth por API Key (para el resto, p.ej. /fraud-score)
     api_key = request.headers.get("X-API-Key")
     if api_key != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    # Rate limit por API key (ventana por minuto)
+    # Rate limit simple por API key (ventana de 60s)
     now = int(datetime.utcnow().timestamp())
     window = now // 60
     key = f"{api_key}:{window}"
@@ -86,8 +87,7 @@ async def api_key_middleware(request: Request, call_next):
     if requests_log[key] > RATE_LIMIT:
         return JSONResponse({"error": "rate_limit_exceeded"}, status_code=429)
 
-    response = await call_next(request)
-    return response
+    return await call_next(request)
 
 
 # --- ENDPOINTS ---
@@ -120,7 +120,7 @@ def get_fraud_score(tx: Transaction):
         raise HTTPException(status_code=500, detail="internal_error")
 
 
-# --- LANDING VISUAL ---
+# --- LANDING PRINCIPAL ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def home():
     return """
@@ -141,10 +141,10 @@ def home():
       <body>
         <div class="tag">LIVE</div>
         <h1>FraudScore API</h1>
-        <p>Calcula un puntaje de riesgo (0–100) para transacciones en tiempo real usando señales de país, IP, monto, horario, velocidad y 3DS. Autenticada por API Key y protegida con rate-limit.</p>
+        <p>Calcula un puntaje de riesgo (0–100) para transacciones en tiempo real usando señales de país, IP, monto, horario, velocidad y 3DS.</p>
         <div class="row">
           <a href="/docs" class="btn">Abrir Docs (Swagger)</a>
-          <a href="/playground" class="btn" style="background:#6ea8fe;color:#0b1020;">Abrir Playground</a>
+          <a href="/playground" class="btn" style="background:#6ea8fe;color:#0b0f17;">Abrir Playground</a>
         </div>
         <footer>© 2025 FraudScore API · Desarrollado por Emiliano Aristi</footer>
       </body>
@@ -152,7 +152,7 @@ def home():
     """
 
 
-# --- PLAYGROUND (HTML + JS) ---
+# --- PLAYGROUND (público) ---
 @app.get("/playground", response_class=HTMLResponse, include_in_schema=False)
 def playground():
     return """
@@ -236,7 +236,7 @@ def playground():
           <button class="btn" id="sendBtn">Calcular Score</button>
           <button class="btn" id="saveBtn" style="background:#34d399">Guardar valores</button>
         </div>
-        <p style="color:var(--muted);font-size:12px;margin-top:8px">Tip: el botón “Guardar valores” recuerda API Key y campos en este navegador.</p>
+        <p style="color:var(--muted);font-size:12px;margin-top:8px">El botón “Guardar valores” recuerda tu API Key y campos localmente.</p>
       </div>
 
       <div class="card">
@@ -338,7 +338,7 @@ def playground():
 """
 
 
-# --- MAIN LOCAL (opcional) ---
+# --- MAIN LOCAL ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
