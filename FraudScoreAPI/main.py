@@ -1,58 +1,63 @@
-# main.py — FraudScore API v2.0 (usuarios + API keys + cuotas + dashboard)
-from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Depends, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-from datetime import datetime
+from sqlalchemy.orm import Session
+from datetime import datetime, date
+import os, time, json, secrets
+from db import get_db, User, ScoreLog
+from auth import find_user_by_key, ensure_month_window
+from dashboard import evaluate, bucket, clamp
 import logging
 
-from db import init_db, get_session, ScoreLog
-from auth import find_user_by_key, check_and_increment_quota, create_user, require_admin
-from dashboard import render_dashboard
-from sqlalchemy.orm import Session
-
-# --------------------------------------------------------------------
-# App + CORS + Logging
-# --------------------------------------------------------------------
-app = FastAPI(
-    title="FraudScore API",
-    description="Scoring antifraude con usuarios, API keys y cuotas por plan.",
-    version="2.0.0",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- CONFIG BASE ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fraudscore")
 
-# Inicializa DB al arrancar
-init_db()
+app = FastAPI(
+    title="FraudScore API",
+    description="API para calcular puntaje de fraude en tiempo real.",
+    version="1.4.0",
+)
 
-# Swagger: botón Authorize con header X-API-Key
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def get_db():
-    db = get_session()
-    try:
-        yield db
-    finally:
-        db.close()
+# --- DEMO + FRONT CONFIG ---
+DEMO_ENABLED = os.getenv("DEMO_ENABLED", "true").lower() == "true"
+API_KEY_FALLBACK = os.getenv("API_KEY_FALLBACK")
+DEMO_RPM = 10
+_rate_bucket = {}  # ip -> (minute_window, count)
 
-# --------------------------------------------------------------------
-# Modelos
-# --------------------------------------------------------------------
+def demo_allowed(ip: str) -> bool:
+    """Simple rate limit per IP for demo mode"""
+    now = int(time.time())
+    win = now // 60
+    last, cnt = _rate_bucket.get(ip, (win, 0))
+    if last != win:
+        _rate_bucket[ip] = (win, 0)
+        last, cnt = win, 0
+    if cnt >= DEMO_RPM:
+        return False
+    _rate_bucket[ip] = (last, cnt + 1)
+    return True
+
+
+# --- MODELOS ---
 class Transaction(BaseModel):
     transaction_id: str
     amount: float
     country: str
     ip: str
     hour: int
-    attempts_last_10m: int = 0
-    three_ds_result: str = "success"
+    attempts_last_10m: int
+    three_ds_result: str
+
 
 class ScoreResponse(BaseModel):
     fraud_score: int
@@ -60,131 +65,252 @@ class ScoreResponse(BaseModel):
     reasons: dict
     timestamp: str
 
-# --------------------------------------------------------------------
-# Scoring (reglas heurísticas)
-# --------------------------------------------------------------------
-def clamp(v: int) -> int:
-    return max(0, min(v, 100))
 
-def bucket(score: int) -> str:
-    if score < 40:  return "LOW"
-    if score < 70:  return "MEDIUM"
-    return "HIGH"
-
-def evaluate(tx: Transaction) -> dict:
-    r = {}
-    if tx.amount > 500:                 r["high_amount"] = 30
-    if tx.country.upper() in {"RU","NG","UA","CN"}: r["untrusted_country"] = 20
-    if tx.hour < 6 or tx.hour > 22:     r["odd_hour"] = 20
-    if tx.ip.startswith(("181.","190.","45.")): r["risky_ip_prefix"] = 10
-    if tx.attempts_last_10m > 3:        r["high_velocity"] = 25
-    if tx.three_ds_result == "failed":  r["3ds_failed"] = 25
-    return r
-
-# --------------------------------------------------------------------
-# Auth por API Key (usuario + cuota)
-# --------------------------------------------------------------------
-def require_user(
-    db: Session = Depends(get_db),
-    api_key: str | None = Depends(api_key_header)
-):
-    user = find_user_by_key(db, api_key or "")
-    if not user:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    # cuota mensual por plan
-    check_and_increment_quota(db, user)
-    return user
-
-# --------------------------------------------------------------------
-# Endpoints públicos
-# --------------------------------------------------------------------
-@app.get("/health", tags=["status"])
-def health():
-    return {"ok": True, "service": "FraudScore API", "version": app.version}
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def home():
-    return """
-    <html>
-      <head><title>FraudScore API</title>
-      <style>
-        body{font-family:Inter,system-ui;background:#0f1117;color:#e5e7eb;text-align:center;padding:56px}
-        a.btn{display:inline-block;margin:8px;padding:12px 20px;border-radius:10px;background:#2563eb;color:#fff;text-decoration:none;font-weight:700}
-        a.btn:hover{background:#1d4ed8} p{color:#9ca3af}
-      </style></head>
-      <body>
-        <h1>FraudScore API</h1>
-        <p>Scoring antifraude con API keys por usuario y cuotas por plan.</p>
-        <a href="/docs" class="btn">Abrir Docs (Swagger)</a>
-        <a href="/playground" class="btn" style="background:#6ea8fe;color:#0b1020">Abrir Playground</a>
-        <p style="margin-top:28px;color:#6b7280">v2.0.0</p>
-      </body>
-    </html>
-    """
-
-# Playground simple: redirige a /docs (puedes mantener tu versión con HTML+JS si lo prefieres)
-@app.get("/playground", response_class=HTMLResponse, include_in_schema=False)
-def playground():
-    return """
-    <script>location.href='/docs';</script>
-    Cargá el Playground desde Swagger (POST /fraud-score) usando tu API Key.
-    """
-
-# --------------------------------------------------------------------
-# Endpoints de negocio (requieren API Key de usuario)
-# --------------------------------------------------------------------
+# --- ENDPOINT PRINCIPAL ---
 @app.post("/fraud-score", response_model=ScoreResponse, tags=["scoring"])
-def fraud_score(tx: Transaction, user = Depends(require_user), db: Session = Depends(get_db)):
+def fraud_score(
+    tx: Transaction,
+    api_key: str = Header(None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    user = find_user_by_key(db, api_key)
+    if not user:
+        raise HTTPException(status_code=401, detail="unauthorized_api_key")
+
+    ensure_month_window(user)
+    if user.used_this_month >= user.monthly_quota:
+        raise HTTPException(status_code=429, detail="quota_exceeded")
+
     try:
         reasons = evaluate(tx)
         total = clamp(int(round(sum(reasons.values()))))
         risk = bucket(total)
         ts = datetime.utcnow().isoformat() + "Z"
 
-        # Log mínimo
-        db.add(ScoreLog(user_id=user.id, amount=int(tx.amount), country=tx.country.upper(), risk=risk, score=total))
+        db.add(
+            ScoreLog(
+                user_id=user.id,
+                amount=int(tx.amount),
+                country=tx.country.upper(),
+                risk=risk,
+                score=total,
+            )
+        )
+        user.used_this_month += 1
         db.commit()
 
         return ScoreResponse(fraud_score=total, risk=risk, reasons=reasons, timestamp=ts)
-    except Exception as e:
-        logging.exception("error in /fraud-score: %s", e)
+    except Exception:
+        db.rollback()
+        logger.exception("Error en /fraud-score")
         raise HTTPException(status_code=500, detail="internal_error")
 
-# --------------------------------------------------------------------
-# Uso del usuario y dashboard (requieren API Key)
-# --------------------------------------------------------------------
-@app.get("/me/usage", tags=["account"])
-def my_usage(user = Depends(require_user)):
-    return {
-        "email": user.email,
-        "plan": user.plan,
-        "used_this_month": user.used_this_month,
-        "monthly_quota": user.monthly_quota,
-        "api_key_tail": user.api_key[-6:],
-    }
 
-@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-def my_dashboard(user = Depends(require_user)):
-    return render_dashboard(
-        email=user.email,
-        plan=user.plan,
-        used=user.used_this_month,
-        quota=user.monthly_quota,
-        api_key=user.api_key
-    )
+# --- ENDPOINT DEMO ---
+@app.post("/demo/fraud-score", response_model=ScoreResponse, tags=["demo"])
+def demo_fraud_score(tx: Transaction, request: Request, db: Session = Depends(get_db)):
+    if not (DEMO_ENABLED and API_KEY_FALLBACK):
+        raise HTTPException(status_code=403, detail="demo_disabled")
 
-# --------------------------------------------------------------------
-# Admin: crear usuarios (protección por ADMIN_TOKEN)
-# --------------------------------------------------------------------
-@app.post("/admin/create-user", tags=["admin"])
-def admin_create_user(email: str, plan: str = "free", admin_token: str = Header(None), db: Session = Depends(get_db)):
-    require_admin(admin_token)
-    u = create_user(db, email=email, plan=plan)
-    return {"email": u.email, "plan": u.plan, "api_key": u.api_key, "monthly_quota": u.monthly_quota}
+    ip = request.headers.get("CF-Connecting-IP") or request.client.host
+    if not demo_allowed(ip):
+        raise HTTPException(status_code=429, detail="demo_rate_limited")
 
-# --------------------------------------------------------------------
-# Dev local
-# --------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    class PseudoUser:
+        id = 0
+        email = "demo@fraudscore.local"
+        plan = "starter"
+        used_this_month = 0
+        monthly_quota = 1000
+        api_key = API_KEY_FALLBACK
+
+    user = PseudoUser()
+
+    try:
+        reasons = evaluate(tx)
+        total = clamp(int(round(sum(reasons.values()))))
+        risk = bucket(total)
+        ts = datetime.utcnow().isoformat() + "Z"
+
+        try:
+            db.add(
+                ScoreLog(
+                    user_id=user.id,
+                    amount=int(tx.amount),
+                    country=tx.country.upper(),
+                    risk=risk,
+                    score=total,
+                )
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        return ScoreResponse(fraud_score=total, risk=risk, reasons=reasons, timestamp=ts)
+    except Exception:
+        logger.exception("Error en /demo/fraud-score")
+        raise HTTPException(status_code=500, detail="internal_error")
+
+
+# --- FRONTEND / PLAYGROUND ---
+@app.get("/playground", response_class=HTMLResponse, include_in_schema=False)
+def playground():
+    demo_badge = "Demo habilitado" if (DEMO_ENABLED and API_KEY_FALLBACK) else "Demo deshabilitado"
+    demo_on = "true" if (DEMO_ENABLED and API_KEY_FALLBACK) else "false"
+
+    return f"""
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FraudScore • Playground</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>body{{font-family:Inter,system-ui}}</style>
+</head>
+<body class="bg-slate-950 text-slate-100">
+  <div class="max-w-6xl mx-auto px-4 py-8">
+    <div class="flex items-center justify-between gap-4">
+      <h1 class="text-3xl font-bold">FraudScore • Playground</h1>
+      <div class="text-sm text-slate-400">{demo_badge}</div>
+    </div>
+    <p class="text-slate-400 mt-1">Probá la API sin salir del navegador. Usá tu <code class="bg-slate-800 px-2 py-0.5 rounded">X-API-Key</code> o activá <span class="font-semibold">Modo Demo</span>.</p>
+
+    <div class="grid md:grid-cols-2 gap-6 mt-6">
+      <!-- FORM -->
+      <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5">
+        <div class="flex items-center gap-3 mb-4">
+          <input id="demoToggle" type="checkbox" class="h-4 w-4 rounded border-slate-700" />
+          <label for="demoToggle" class="text-slate-300">Usar <span class="font-semibold">Modo Demo</span> (sin API Key)</label>
+        </div>
+
+        <div id="apiKeyRow" class="mb-4">
+          <label class="block text-sm text-slate-300 mb-1">API Key (header <b>X-API-Key</b>)</label>
+          <input id="apiKey" class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2" placeholder="pega tu API Key aquí" />
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm text-slate-300 mb-1">Monto</label>
+            <input id="amount" type="number" value="890" class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2" />
+          </div>
+          <div>
+            <label class="block text-sm text-slate-300 mb-1">Hora (0–23)</label>
+            <input id="hour" type="number" value="23" class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2" />
+          </div>
+          <div>
+            <label class="block text-sm text-slate-300 mb-1">País (ISO2)</label>
+            <input id="country" value="RU" class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2" />
+          </div>
+          <div>
+            <label class="block text-sm text-slate-300 mb-1">Intentos últimos 10m</label>
+            <input id="attempts" type="number" value="6" class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2" />
+          </div>
+          <div class="col-span-2">
+            <label class="block text-sm text-slate-300 mb-1">IP</label>
+            <input id="ip" value="181.45.77.2" class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2" />
+          </div>
+          <div class="col-span-2">
+            <label class="block text-sm text-slate-300 mb-1">3DS</label>
+            <select id="threeDS" class="w-full rounded-lg bg-slate-800 border border-slate-700 px-3 py-2">
+              <option value="success">success</option>
+              <option selected value="failed">failed</option>
+              <option value="unavailable">unavailable</option>
+            </select>
+          </div>
+        </div>
+
+        <button id="runBtn" class="mt-5 inline-flex items-center gap-2 bg-blue-500 hover:bg-blue-600 text-slate-950 font-semibold px-4 py-2 rounded-lg">
+          Calcular Score
+        </button>
+      </div>
+
+      <!-- RESULT -->
+      <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5">
+        <div class="flex items-center justify-between">
+          <div class="text-slate-300">Resultado</div>
+          <div id="pill" class="px-3 py-1 rounded-full text-sm font-semibold bg-slate-800 border border-slate-700">…</div>
+        </div>
+        <pre id="out" class="mt-3 text-sm bg-slate-950/60 border border-slate-800 rounded-xl p-3 overflow-auto min-h-[260px]"></pre>
+      </div>
+    </div>
+
+    <div class="mt-6 text-slate-400 text-sm">
+      ¿Documentación? <a class="text-blue-400 underline" href="/docs">/docs</a>
+    </div>
+  </div>
+
+<script>
+  const DEMO_ON = {demo_on};
+  const demoToggle = document.getElementById('demoToggle');
+  const apiKeyRow  = document.getElementById('apiKeyRow');
+  const apiKey     = document.getElementById('apiKey');
+  const pill       = document.getElementById('pill');
+  const out        = document.getElementById('out');
+
+  demoToggle.checked = DEMO_ON;
+  apiKeyRow.style.display = DEMO_ON ? 'none' : 'block';
+
+  demoToggle.addEventListener('change', ()=> {{
+    apiKeyRow.style.display = demoToggle.checked ? 'none' : 'block';
+  }});
+
+  function riskPill(risk) {{
+    const map = {{
+      LOW:    'bg-emerald-400 text-emerald-950',
+      MEDIUM: 'bg-amber-400 text-amber-950',
+      HIGH:   'bg-rose-400 text-rose-950'
+    }};
+    pill.className = 'px-3 py-1 rounded-full text-sm font-semibold '+(map[risk]||'bg-slate-800');
+    pill.textContent = risk || '…';
+  }}
+
+  document.getElementById('runBtn').addEventListener('click', async () => {{
+    const body = {{
+      transaction_id: 'tx_demo',
+      amount: parseFloat(document.getElementById('amount').value||0),
+      country: document.getElementById('country').value.trim(),
+      ip: document.getElementById('ip').value.trim(),
+      hour: parseInt(document.getElementById('hour').value||0),
+      attempts_last_10m: parseInt(document.getElementById('attempts').value||0),
+      three_ds_result: document.getElementById('threeDS').value
+    }};
+
+    try {{
+      let url = '/fraud-score';
+      let headers = {{'Content-Type':'application/json'}};
+
+      if (demoToggle.checked) {{
+        url = '/demo/fraud-score';
+      }} else {{
+        const k = apiKey.value.trim();
+        if (!k) throw new Error('Pegá tu API Key o activa Modo Demo.');
+        headers['X-API-Key'] = k;
+      }}
+
+      const r = await fetch(url, {{
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      }});
+
+      const data = await r.json();
+      if (!r.ok) throw new Error((data && data.detail) || 'Error');
+
+      riskPill(data.risk);
+      out.textContent = JSON.stringify(data, null, 2);
+    }} catch(e) {{
+      riskPill('');
+      out.textContent = JSON.stringify({{error: e.message}}, null, 2);
+    }}
+  }});
+</script>
+</body>
+</html>
+"""
+# --- HEALTH CHECK ---
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "FraudScore API", "version": app.version}
